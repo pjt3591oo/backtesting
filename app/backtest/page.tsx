@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import {
   Bitcoin,
   Play,
@@ -14,7 +14,6 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Header } from "@/components/header";
-import { getApiHeaders } from "@/lib/api-config";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Progress } from "@/components/ui/progress";
@@ -27,17 +26,12 @@ import {
   YAxis,
   Tooltip,
 } from "recharts";
-import {
-  demoCandles,
-  features,
-  advance,
-  initialPortfolio,
-  ruleDecision,
-  type Candle,
-  type Decision,
-  type Point,
-} from "@/lib/backtest";
 import { CandleChart } from "@/components/candle-chart";
+import { useApiStatus } from "@/hooks/use-api-status";
+import {
+  useBacktest,
+  type BacktestMode,
+} from "@/hooks/use-backtest";
 const money = (v: number) =>
   v.toLocaleString("en-US", {
     maximumFractionDigits: 2,
@@ -49,211 +43,44 @@ const names = {
   hold: "관망",
 };
 export default function Home() {
-  const [mode, setMode] = useState("jev"),
+  const [mode, setMode] = useState<BacktestMode>("jev"),
     [start, setStart] = useState("2024-01-01"),
     [end, setEnd] = useState("2024-03-31");
   const [capital, setCapital] = useState("10000"),
     [fee, setFee] = useState("0.1"),
     [slip, setSlip] = useState("0.05"),
     [threshold, setThreshold] = useState("0.5");
-  const [rows, setRows] = useState<Point[]>([]),
-    [running, setRunning] = useState(false),
-    [status, setStatus] = useState("실행 준비"),
-    [error, setError] = useState("");
-  const [selected, setSelected] = useState(0),
-    [total, setTotal] = useState(0),
-    [connected, setConnected] = useState(false),
-    [serverModel, setServerModel] = useState(""),
-    [runMode, setRunMode] = useState("demo"),
-    [runCapital, setRunCapital] = useState(10000),
-    [config, setConfig] = useState<object>({});
-  const abort = useRef<AbortController | null>(null);
-  useEffect(() => {
-    let active = true;
-    const check = async () => {
-      try {
-        const r = await fetch("/api/status");
-        const d = (await r.json()) as {
-          connected: boolean;
-          model?: string;
-        };
-        if (active) {
-          setConnected(d.connected);
-          setServerModel(d.model ?? "");
-        }
-      } catch {
-        if (active) setConnected(false);
-      }
-    };
-    void check();
-    const timer = setInterval(check, 15000);
-    return () => {
-      active = false;
-      clearInterval(timer);
-      abort.current?.abort();
-    };
-  }, []);
+
+  const { connected, model: serverModel } = useApiStatus();
+  const {
+    rows,
+    selected,
+    setSelected,
+    total,
+    running,
+    status,
+    error,
+    runMode,
+    runCapital,
+    run,
+    stop,
+    download,
+  } = useBacktest(connected);
   const latest = rows.at(-1),
     focus = rows[selected] ?? latest,
     returnPct = latest ? (latest.equity / runCapital - 1) * 100 : 0;
   const trades = rows.filter((r) => r.executed !== "hold"),
     drawdown = rows.length ? Math.min(...rows.map((r) => r.drawdown)) : 0;
-  async function run() {
-    const c = Number(capital),
-      f = Number(fee) / 100,
-      s = Number(slip) / 100,
-      t = Number(threshold);
-    if (
-      !Number.isFinite(c) ||
-      c <= 0 ||
-      !Number.isFinite(f) ||
-      f < 0 ||
-      f > 0.05 ||
-      !Number.isFinite(s) ||
-      s < 0 ||
-      s > 0.05 ||
-      !Number.isFinite(t) ||
-      t < 0.5 ||
-      t > 1
-    ) {
-      setError("초기 자금과 비용, 판단 기준을 확인해 주세요.");
-      return;
-    }
-    const days = (Date.parse(end) - Date.parse(start)) / 86400000 + 1;
-    if (
-      !Number.isFinite(days) ||
-      days < 2 ||
-      days > 366 ||
-      Date.parse(end) + 86400000 > Date.now() ||
-      Date.parse(start) < Date.parse("2018-01-01")
-    ) {
-      setError("2018년 이후 완료된 날짜에서 2~366일을 선택해 주세요.");
-      return;
-    }
-    const controller = new AbortController();
-    abort.current = controller;
-    setRunning(true);
-    setError("");
-    setRows([]);
-    setSelected(0);
-    setTotal(0);
-    setRunMode(mode);
-    setRunCapital(c);
-    setConfig({
+  const handleRun = () =>
+    void run({
+      mode,
       start,
       end,
-      capital: c,
-      fee: f,
-      slippage: s,
-      threshold: t,
-      interval: "1d",
-      mode,
+      capital,
+      fee,
+      slippage: slip,
+      threshold,
     });
-    try {
-      setStatus("캔들 데이터 준비 중");
-      let data: Candle[];
-      if (mode === "demo") data = demoCandles(start, end);
-      else {
-        const r = await fetch(`/api/candles?start=${start}&end=${end}`, {
-          signal: controller.signal,
-        });
-        const body = (await r.json()) as {
-          error?: string;
-          candles: Candle[];
-        };
-        if (!r.ok) throw Error(body.error);
-        data = body.candles;
-      }
-      setTotal(data.length - 21);
-      let portfolio = initialPortfolio(c);
-      const result: Point[] = [];
-      for (let i = 20; i < data.length - 1; i++) {
-        if (controller.signal.aborted)
-          throw new DOMException("Stopped", "AbortError");
-        const input = features(data.slice(0, i + 1));
-        let decision: Decision;
-        setStatus(
-          `${mode === "jev" ? "Jev 판단" : "규칙 분석"} 중 · ${data[i].date}`,
-        );
-        if (mode === "jev") {
-          console.log("Jev 판단 요청", input);
-          const r = await fetch("/api/decision", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              ...getApiHeaders(),
-            },
-            body: JSON.stringify({
-              input,
-              position: portfolio.units > 0 ? "long" : "flat",
-            }),
-            signal: controller.signal,
-          });
-          const body = (await r.json()) as Decision & {
-            error?: string;
-          };
-          if (!r.ok) throw Error(body.error);
-          decision = body;
-        } else decision = ruleDecision(input);
-        const point = advance(
-          portfolio,
-          data[i + 1],
-          input,
-          decision,
-          {
-            fee: f,
-            slippage: s,
-            threshold: t,
-          },
-          result.length ? result[0].benchmarkEntry : data[i + 1].open * (1 + s),
-          c,
-        );
-        portfolio = point.portfolio;
-        result.push(point);
-        setRows([...result]);
-        setSelected(result.length - 1);
-        if (mode !== "jev")
-          await new Promise<void>((resolve) => setTimeout(resolve, 25));
-      }
-      setStatus("백테스트 완료");
-    } catch (e) {
-      if (e instanceof Error && e.name === "AbortError")
-        setStatus("실행 중단 · 부분 결과");
-      else {
-        setError(e instanceof Error ? e.message : "실행에 실패했습니다.");
-        setStatus("실행 실패 · 부분 결과");
-      }
-    } finally {
-      setRunning(false);
-      abort.current = null;
-    }
-  }
-  function download() {
-    const a = document.createElement("a");
-    const url = URL.createObjectURL(
-      new Blob(
-        [
-          JSON.stringify(
-            {
-              config,
-              status,
-              source: runMode === "demo" ? "synthetic" : "Binance BTCUSDT",
-              rows,
-            },
-            null,
-            2,
-          ),
-        ],
-        {
-          type: "application/json",
-        },
-      ),
-    );
-    a.href = url;
-    a.download = "bitcoin-backtest.json";
-    a.click();
-    URL.revokeObjectURL(url);
-  }
   return (
     <div className="app-shell">
       <Header activeTab="backtest" connected={connected} />
@@ -297,7 +124,7 @@ export default function Home() {
               <select
                 id="mode"
                 value={mode}
-                onChange={(e) => setMode(e.target.value)}
+                onChange={(e) => setMode(e.target.value as BacktestMode)}
               >
                 <option value="demo">예제 체험 · 합성 시세 + 규칙</option>
                 <option value="rules">실제 시세 · 이동평균 규칙</option>
@@ -378,7 +205,7 @@ export default function Home() {
             <Button
               className="run-button"
               disabled={!running && mode === "jev" && !connected}
-              onClick={running ? () => abort.current?.abort() : run}
+              onClick={running ? stop : handleRun}
             >
               {running ? <Square size={16} /> : <Play size={16} />}{" "}
               {running ? "실행 중단" : "백테스트 실행"}

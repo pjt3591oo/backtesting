@@ -1,14 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Activity, Play, Square, RefreshCw, ArrowLeft } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Header } from "@/components/header";
-import { getApiHeaders } from "@/lib/api-config";
 import { Progress } from "@/components/ui/progress";
 import { CandleChart } from "@/components/candle-chart";
-import type { LiveResult } from "@/lib/live";
+import { useLiveMarket } from "@/hooks/use-live-market";
 const price = (n: number) =>
   n.toLocaleString("en-US", {
     maximumFractionDigits: 2,
@@ -18,74 +16,23 @@ const time = (n: number) =>
     hour12: false,
   });
 export default function Live() {
-  const [active, setActive] = useState(false),
-    [busy, setBusy] = useState(false),
-    [error, setError] = useState(""),
-    [data, setData] = useState<LiveResult | null>(null),
-    [history, setHistory] = useState<LiveResult[]>([]),
-    [now, setNow] = useState(0);
-  const abort = useRef<AbortController | null>(null),
-    mounted = useRef(true);
-  async function refresh() {
-    if (abort.current) return;
-    const controller = new AbortController();
-    abort.current = controller;
-    setBusy(true);
-    setError("");
-    try {
-      const r = await fetch("/api/live", {
-        method: "POST",
-        headers: getApiHeaders(),
-        signal: controller.signal,
-      });
-      const result = (await r.json()) as LiveResult & {
-        error?: string;
-      };
-      if (!r.ok) throw Error(result.error || "판단을 받지 못했습니다.");
-      if (!controller.signal.aborted && mounted.current) {
-        setData(result);
-        setNow(Date.now());
-        setHistory((h) => [result, ...h].slice(0, 50));
-      }
-    } catch (e) {
-      if (!controller.signal.aborted && mounted.current)
-        setError(e instanceof Error ? e.message : "연결에 실패했습니다.");
-    } finally {
-      if (abort.current === controller) abort.current = null;
-      if (mounted.current) setBusy(false);
-    }
-  }
-  useEffect(() => {
-    mounted.current = true;
-    const tick = setInterval(() => setNow(Date.now()), 1000);
-    return () => {
-      mounted.current = false;
-      clearInterval(tick);
-      abort.current?.abort();
-    };
-  }, []);
-  useEffect(() => {
-    if (!active) return;
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout>;
-    async function loop() {
-      if (!document.hidden) await refresh();
-      if (!disposed) timer = setTimeout(loop, 30000);
-    }
-    void loop();
-    return () => {
-      disposed = true;
-      clearTimeout(timer);
-      abort.current?.abort();
-    };
-  }, [active]);
+  const {
+    active,
+    setActive,
+    busy,
+    error,
+    data,
+    history,
+    now,
+    refresh,
+    stale,
+    valid,
+  } = useLiveMarket();
   const labels: Record<string, string> = {
     buy: "매수",
     sell: "매도",
     wait: "관망",
   };
-  const stale = !!data && now - data.observedAt > 90000,
-    valid = !!data && !stale && !error;
   return (
     <div className="app-shell">
       <Header activeTab="live" />
@@ -131,7 +78,7 @@ export default function Live() {
                 {busy ? "분석 중" : active ? "자동 갱신 켜짐" : "수동 모드"}
               </span>
             </div>
-            <div className={`live-verdict ${valid ? data.signal : "hold"}`}>
+            <div className={`live-verdict ${valid && data ? data.signal : "hold"}`}>
               {!data ? "판단 대기" : !valid ? "판단 보류" : labels[data.signal]}
             </div>
             <p className="live-explanation">
